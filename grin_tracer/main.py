@@ -30,6 +30,35 @@ def _to_composition(index):
     composition = tan(np.pi*(concentration - 0.5))
     return composition
 
+def _loss(target_rays: RayBundle, propagated_rays: RayBundle) -> torch.Tensor:
+    # target_rays and propagated_rays should have the same number of rays
+    assert target_rays.rays.shape[1] == propagated_rays.rays.shape[1]
+    # [2, NRays]: [[dy**2, dx**2], [dy**2, dx**2], ...]
+    delta_xy_squared = (target_rays.rays[0:2] - propagated_rays.rays[0:2])**2
+    # [1, NRays]: [hypot1, hypot2, ...]
+    hypots = torch.sqrt(torch.sum(delta_xy_squared, dim=0))
+    pos_loss = torch.sum(hypots)
+
+    # We also want to penalize rays that are not pointing in the right direction.
+    # We do this by computing the angle between the two direction vectors.
+    # The direction vectors are (1, p, q) where p = dy/dz and q = dx/dz.
+    # The cosine of the angle between two vectors a and b is given by:
+    # First we take the dot product of all of these vectors:
+    dot_products = (1 + target_rays.rays[2] * propagated_rays.rays[2] + target_rays.rays[3] * propagated_rays.rays[3])
+    # Then we take the magnitude of each vector:
+    target_magnitudes = torch.sqrt(1 + target_rays.rays[2]**2 + target_rays.rays[3]**2)
+    propagated_magnitudes = torch.sqrt(1 + propagated_rays.rays[2]**2 + propagated_rays.rays[3]**2)
+    # Now we can compute the cosine of the angle between each pair of vectors:
+    cos_angles = dot_products / (target_magnitudes * propagated_magnitudes)
+    # We want a value that is large for large angles, so we use 1 - cos(angle):
+    angle_losses = 1 - cos_angles
+    angle_loss = torch.sum(angle_losses)
+
+    # This weighting is arbitrary
+    loss = pos_loss + angle_loss
+
+    return loss
+
 class Refractive3DOptic:
     coord: Coordinates
 
@@ -37,17 +66,18 @@ class Refractive3DOptic:
         self.coords = coords
         self.composition = torch.zeros(coords.shape, dtype=torch.float64)
 
-    def gradient_update(self):
-        # Create input ray bundle
-        input_rays, output_rays = RayBundle(), RayBundle()
+    def gradient_update(self, sampler, n_rays: int = 100):
+        # Create ray bundles
+        input_rays, output_rays = sampler(n_rays)
         # propagate the rays through
         propagated_rays = self.propagate_rays(input_rays, keep_paths=False)[-1]
-        # compute the loss of each ray
-
-        # compute the global loss
+        loss = _loss(output_rays, propagated_rays)
         # call backward to compute the gradient
+        loss.backward()
         # apply the gradient to the composition tensor
-        pass
+        with torch.no_grad():
+            self.composition -= 0.01 * self.composition.grad
+        self.composition.grad.zero_()
 
     def propagate_rays(self, ray_bundle: RayBundle, keep_paths: bool = False) -> list[RayBundle]:
         # compute the index field from the composition
@@ -165,6 +195,7 @@ class Refractive3DOptic:
             ray = np.zeros((len(ray_bundles), 3), dtype=np.float64) # (z steps, 3)
             for bundle_idx in range(len(ray_bundles)):
                 ray[bundle_idx, 0] = ray_bundles[bundle_idx].z
+                print(ray_bundles[bundle_idx].rays)
                 ray[bundle_idx, 1:3] = ray_bundles[bundle_idx].rays[0:2, ray_idx].detach().cpu().numpy()
 
             # viewer.add_points(ray, size=0.2, face_color='red', name=f"Ray {ray_idx}")
@@ -188,17 +219,44 @@ coords = Coordinates(
     -1, 1, 100
 )
 
+def sampler(n: int):
+    # Produce rays that emerge from a point at z = -1 and focus to a point at z = 1 with random
+    # angular distribution.
+    injection_angles = torch.rand(n, 2) * 2 * np.pi
+    input_rays = RayBundle(torch.Tensor([-1] * n).double(), torch.Tensor([[0] * n, [0] * n, [np.cos(theta) for theta in injection_angles[:, 0]], [np.sin(theta) for theta in injection_angles[:, 1]]]).double())
+    output_rays = RayBundle(torch.Tensor([1] * n).double(), torch.Tensor([[0] * n, [0] * n, [-np.cos(theta) for theta in injection_angles[:, 0]], [-np.sin(theta) for theta in injection_angles[:, 1]]]).double())
+    return input_rays, output_rays
+
 optic = Refractive3DOptic(coords)
 r2 = coords.xx**2 + coords.yy**2 + coords.zz**2
-fisheye = np.ones_like(r2)
-fisheye[r2 < 1] = 2 / (1 + r2[r2 < 1])
+fisheye = np.ones_like(r2) * 1.5
+# fisheye[r2 < 1] = 2 / (1 + r2[r2 < 1])
 fisheye = _to_composition(fisheye)
-optic.composition = torch.from_numpy(fisheye)
-
-N = 2**15
-input_rays = RayBundle(torch.Tensor([-1]).double(), torch.Tensor([[0] * N, [0] * N, [np.cos(theta) for theta in np.linspace(0, 2 * np.pi, N, endpoint=False)], [np.sin(theta) for theta in np.linspace(0, 2 * np.pi, N, endpoint=False)]]).double())
-import time
-start_time = time.time()
-ray_sequence = optic.propagate_rays(input_rays, keep_paths=True)
-print(f"Propagated {N} rays through {coords.nz} planes in {time.time() - start_time:.2f} seconds")
+torch.autograd.set_detect_anomaly(True)
+optic.composition = torch.from_numpy(fisheye).requires_grad_()
+# N = 1
+# input_rays = RayBundle(torch.Tensor([-1]).double(), torch.Tensor([[0] * N, [0] * N, [np.cos(theta) for theta in np.linspace(0, 2 * np.pi, N, endpoint=False)], [np.sin(theta) for theta in np.linspace(0, 2 * np.pi, N, endpoint=False)]]).double())
+# ray_sequence = optic.propagate_rays(input_rays, keep_paths=True)
 # optic.visualize_rays(ray_sequence)
+
+for iteration in range(100):
+    print(f"Iteration {iteration}")
+    optic.gradient_update(sampler, n_rays=100)
+    if iteration % 10 == 0:
+        input_rays, output_rays = sampler(10)
+        ray_sequence = optic.propagate_rays(input_rays, keep_paths=True)
+        optic.visualize_rays(ray_sequence)
+        # Also visualize the index field
+        import napari
+        index = _to_index(optic.composition).detach().cpu().numpy()
+        viewer = napari.Viewer()
+        viewer.add_image(
+            index,
+            name="Refractive Index",
+            scale=(optic.coords.dz, optic.coords.dy, optic.coords.dx),
+            translate=(optic.coords.z_min_center, optic.coords.y_min_center, optic.coords.x_min_center),
+            colormap="plasma",
+            contrast_limits=(1.0, 2.0),
+        )
+        viewer.show()
+        napari.run()
