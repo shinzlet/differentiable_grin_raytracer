@@ -288,32 +288,40 @@ import matplotlib.pyplot as plt
 counter = 0
 first_loop = True
 while True:
-    print(f"Iteration {optic._iteration}")
-    if counter == 0:
-        if not first_loop:
-            input_rays, output_rays = sampler(10)
-            # print(input_rays)
-            ray_sequence = optic.propagate_rays(input_rays, keep_paths=True)
-            # print(ray_sequence)
-            viewer = napari.Viewer()
-            viewer.layers.clear()
-            optic.visualize_rays(ray_sequence, viewer)
-            viewer.show()
-            napari.run()
+    try:
+        print(f"Iteration {optic._iteration}")
+        if counter == 0:
+            if not first_loop:
+                input_rays, output_rays = sampler(10)
+                # print(input_rays)
+                ray_sequence = optic.propagate_rays(input_rays, keep_paths=True)
+                # print(ray_sequence)
+                viewer = napari.Viewer()
+                viewer.layers.clear()
+                optic.visualize_rays(ray_sequence, viewer)
+                viewer.show()
+                napari.run()
 
-            plt.plot(optic._losses)        
-            plt.yscale('log')
-            plt.xlabel('Iteration')
-            plt.ylabel('Loss')
-            plt.title('Loss over Iterations')
-            plt.grid(True)
-            plt.show()
+                plt.plot(optic._losses)        
+                plt.yscale('log')
+                plt.xlabel('Iteration')
+                plt.ylabel('Loss')
+                plt.title('Loss over Iterations')
+                plt.grid(True)
+                plt.show()
 
-        counter = input("how many iterations to run? ")
-        counter = int(counter)
-        first_loop = False
+            counter = input("how many iterations to run? ")
+            counter = int(counter)
+            first_loop = False
 
-    optic.gradient_update(sampler, n_rays=1000)
-    counter -= 1
+        optic.gradient_update(sampler, n_rays=1000)
+        counter -= 1
+    except KeyboardInterrupt:
+        try:
+            input("Keyboard interrupt: forcing visualization. Press Enter to continue, or Ctrl-C again to quit.")
+            counter = 0
+        except KeyboardInterrupt:
+            print("Exiting")
+            break
 
 napari.run()
