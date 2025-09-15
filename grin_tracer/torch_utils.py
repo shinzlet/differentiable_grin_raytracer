@@ -7,7 +7,8 @@ import numpy as np
 def interp_value_2d(index_yx: torch.Tensor,
                     pts_yx: torch.Tensor,
                     coords: Coordinates,
-                    padding_mode: str = "border") -> torch.Tensor:
+                    padding_mode: str = "zeros",
+                    replace_zeros: float | None = None) -> torch.Tensor:
     """
     Bilinear interpolation on a 2D plane given arbitrary (y, x) points.
 
@@ -18,6 +19,12 @@ def interp_value_2d(index_yx: torch.Tensor,
                   and x in [coords.x_center_min, coords.x_center_max].
         coords:   Coordinates object, used to normalize to [-1, 1] for grid_sample.
         padding_mode: Passed to grid_sample ("border", "zeros", "reflection").
+        replace_zeros: Replace any sampled zeros with this value.
+                        This is useful if you want constnat nonzero padding to avoid NaNs during interpolation.
+                        This only works in cases where 0 is not a valid valud in your input data:
+                        Leave this as None rather than 0.0 if zeros are valid values in the field - 
+                        this method has no way of distinguishing between valid zeros and zeros introduced by
+                        padding, and if you replace legitimate zeros, the gradient will not flow correctly.
 
     Returns:
         (M,) tensor of interpolated values. Grad flows into index_yx if it requires_grad.
@@ -41,6 +48,10 @@ def interp_value_2d(index_yx: torch.Tensor,
     vals = F.grid_sample(
         V, grid, mode="bilinear", padding_mode=padding_mode, align_corners=True
     ).view(-1)
+
+    if replace_zeros is not None:
+        # Replace zeros with replace_zeros value
+        vals = torch.where(vals == 0, torch.tensor(replace_zeros, device=vals.device, dtype=vals.dtype), vals)
 
     return vals
 

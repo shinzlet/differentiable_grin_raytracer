@@ -35,6 +35,7 @@ def _loss(target_rays: RayBundle, propagated_rays: RayBundle, coords: Coordinate
     assert target_rays.rays.shape[1] == propagated_rays.rays.shape[1]
     # [2, NRays]: [[dy**2, dx**2], [dy**2, dx**2], ...]
     delta_xy_squared = (target_rays.rays[0:2] - propagated_rays.rays[0:2])**2
+    
     # [1, NRays]: [hypot1, hypot2, ...]
     hypots = torch.sqrt(torch.sum(delta_xy_squared, dim=0))
     # We sum and then normalize to the max hypot to make the scale of the angle loss (-1 to 1)
@@ -68,8 +69,9 @@ class Refractive3DOptic:
 
     def __init__(self, coords: Coordinates):
         self.coords = coords
-        self.composition = torch.zeros(coords.shape, dtype=torch.float64)
+        self.composition = torch.zeros(coords.shape, dtype=torch.float64, requires_grad=True)
         self._iteration = 0
+        self._optimizer = torch.optim.Adam([self.composition], lr=0.01)
 
     def gradient_update(self, sampler, n_rays: int = 100):
         # Create ray bundles
@@ -77,11 +79,14 @@ class Refractive3DOptic:
         # propagate the rays through
         propagated_rays = self.propagate_rays(input_rays, keep_paths=False)[-1]
         loss = _loss(output_rays, propagated_rays, self.coords, self._iteration)
+        
+        # Zero gradients before backward pass
+        self._optimizer.zero_grad()
         # call backward to compute the gradient
         loss.backward()
-        # apply the gradient to the composition tensor
-        with torch.no_grad():
-            self.composition -= 0.01 * self.composition.grad
+        # apply the gradient using Adam optimizer
+        self._optimizer.step()
+        
         self.composition.grad.zero_()
 
         self._iteration += 1
@@ -120,10 +125,13 @@ class Refractive3DOptic:
             
             # Now, all of our values can be 2 dimensionally interpolated from this plane.
             ray_points = rays[:2] # [[y1 y2 y3 y4 ...], [x1 x2 x3 x4 ...]]
-            n_points = interp_value_2d(n_plane, ray_points, self.coords)
-            nz_points = interp_value_2d(nz_plane, ray_points, self.coords)
-            ny_points = interp_value_2d(ny_plane, ray_points, self.coords)
-            nx_points = interp_value_2d(nx_plane, ray_points, self.coords)
+            # For the index, the "free space" around the optic is index = 1, so we replace
+            # zeros with 1. For the gradients, zero is well defined (and air is homogeneous),
+            # so we don't do replacement.
+            n_points = interp_value_2d(n_plane, ray_points, self.coords, padding_mode="zeros", replace_zeros=1.0)
+            nz_points = interp_value_2d(nz_plane, ray_points, self.coords, padding_mode="zeros")
+            ny_points = interp_value_2d(ny_plane, ray_points, self.coords, padding_mode="zeros")
+            nx_points = interp_value_2d(nx_plane, ray_points, self.coords, padding_mode="zeros")
 
             # This is not actually momentum, it's 1 + p^2 + q^2 which is a quantity that
             # appears a lot in the ODEs
@@ -132,8 +140,11 @@ class Refractive3DOptic:
             # ODEs:
             yp = rays[2]
             xp = rays[3]
-            dydz_p = (momentum / n_points) * (ny_points - rays[2] * nz_points)
-            dxdz_p = (momentum / n_points) * (nx_points - rays[3] * nz_points)
+            # We clamp the derivatives to avoid blowup to NaN (which kills backprop). Right now,
+            # we don't penalize these rays: they would be easy to spot in debug visualization, and
+            # likely are so uncontrollable that their loss is enormous already.
+            dydz_p = torch.clamp((momentum / n_points) * (ny_points - rays[2] * nz_points), -10, 10)
+            dxdz_p = torch.clamp((momentum / n_points) * (nx_points - rays[3] * nz_points), -10, 10)
 
             return torch.stack([yp, xp, dydz_p, dxdz_p])
 
@@ -229,7 +240,7 @@ class Refractive3DOptic:
 
 # validation: maxwell's fisheye
 coords = Coordinates(
-    0, 1, 50,
+    0, 1, 40,
     -1, 1, 40,
     -1, 1, 40
 )
@@ -238,7 +249,7 @@ def sampler(n: int):
     # Produce rays that emerge from a point at z = -1 and focus to a point at z = 1 with random
     # angular distribution.
     injection_angles = torch.rand(n, 1) * 2 * np.pi + 0.1
-    angle_magnitudes = torch.rand(n, 1) * 2
+    angle_magnitudes = torch.rand(n, 1) * 5
     input_rays = RayBundle(
         torch.Tensor([0]).double(),
         torch.Tensor([
@@ -274,7 +285,7 @@ import napari
 iteration = 0
 while True:
     print(f"Iteration {iteration}")
-    if iteration % 10 == 0 and iteration > 0:
+    if iteration % 30 == 0 and iteration > 0:
         input_rays, output_rays = sampler(10)
         # print(input_rays)
         ray_sequence = optic.propagate_rays(input_rays, keep_paths=True)
@@ -284,7 +295,7 @@ while True:
         optic.visualize_rays(ray_sequence, viewer)
         viewer.show()
         napari.run()
-    optic.gradient_update(sampler, n_rays=10000)
+    optic.gradient_update(sampler, n_rays=2000)
     iteration += 1
 
 napari.run()
