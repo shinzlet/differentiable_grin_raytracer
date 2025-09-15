@@ -58,8 +58,8 @@ def _loss(target_rays: RayBundle, propagated_rays: RayBundle, coords: Coordinate
     angle_loss = torch.sum(angle_losses)
 
     # This weighting is arbitrary. We use a schedule to prefer position at the start and angle at the end.
-    # 50/50 is achieved asymptotically, time constant is 100 iterations
-    angle_weight = 0.5 * (1 - np.exp(-iteration / 100))
+    # 50/50 is achieved asymptotically, time constant is 1000 iterations
+    angle_weight = 0.5 * (1 - np.exp(-iteration / 1000))
     loss = (1 - angle_weight) * pos_loss + angle_weight * angle_loss * 2
 
     return loss
@@ -71,7 +71,8 @@ class Refractive3DOptic:
         self.coords = coords
         self.composition = torch.zeros(coords.shape, dtype=torch.float64, requires_grad=True)
         self._iteration = 0
-        self._optimizer = torch.optim.Adam([self.composition], lr=0.01)
+        self._optimizer = torch.optim.Adam([self.composition], lr=0.001)
+        self._losses = []
 
     def gradient_update(self, sampler, n_rays: int = 100):
         # Create ray bundles
@@ -89,6 +90,7 @@ class Refractive3DOptic:
         
         self.composition.grad.zero_()
 
+        self._losses.append(loss.item())
         self._iteration += 1
 
     def propagate_rays(self, ray_bundle: RayBundle, keep_paths: bool = False) -> list[RayBundle]:
@@ -249,7 +251,7 @@ def sampler(n: int):
     # Produce rays that emerge from a point at z = -1 and focus to a point at z = 1 with random
     # angular distribution.
     injection_angles = torch.rand(n, 1) * 2 * np.pi + 0.1
-    angle_magnitudes = torch.rand(n, 1) * 5
+    angle_magnitudes = torch.rand(n, 1) * 3
     input_rays = RayBundle(
         torch.Tensor([0]).double(),
         torch.Tensor([
@@ -270,32 +272,48 @@ def sampler(n: int):
     return input_rays, output_rays
 
 optic = Refractive3DOptic(coords)
-r2 = coords.xx**2 + coords.yy**2 + coords.zz**2
-fisheye = np.ones_like(r2) * 1.5
-# fisheye[r2 < 1] = 2 / (1 + r2[r2 < 1])
-fisheye = _to_composition(fisheye)
-torch.autograd.set_detect_anomaly(True)
-optic.composition = torch.from_numpy(fisheye).requires_grad_()
+# r2 = coords.xx**2 + coords.yy**2 + coords.zz**2
+# fisheye = np.ones_like(r2) * 1.5
+# # fisheye[r2 < 1] = 2 / (1 + r2[r2 < 1])
+# fisheye = _to_composition(fisheye)
+# torch.autograd.set_detect_anomaly(True)
+# optic.composition = torch.from_numpy(fisheye).requires_grad_()
 # N = 1
 # input_rays = RayBundle(torch.Tensor([-1]).double(), torch.Tensor([[0] * N, [0] * N, [np.cos(theta) for theta in np.linspace(0, 2 * np.pi, N, endpoint=False)], [np.sin(theta) for theta in np.linspace(0, 2 * np.pi, N, endpoint=False)]]).double())
 # ray_sequence = optic.propagate_rays(input_rays, keep_paths=True)
 # optic.visualize_rays(ray_sequence)
 
 import napari
-iteration = 0
+import matplotlib.pyplot as plt
+counter = 0
+first_loop = True
 while True:
-    print(f"Iteration {iteration}")
-    if iteration % 30 == 0 and iteration > 0:
-        input_rays, output_rays = sampler(10)
-        # print(input_rays)
-        ray_sequence = optic.propagate_rays(input_rays, keep_paths=True)
-        # print(ray_sequence)
-        viewer = napari.Viewer()
-        viewer.layers.clear()
-        optic.visualize_rays(ray_sequence, viewer)
-        viewer.show()
-        napari.run()
-    optic.gradient_update(sampler, n_rays=2000)
-    iteration += 1
+    print(f"Iteration {optic._iteration}")
+    if counter == 0:
+        if not first_loop:
+            input_rays, output_rays = sampler(10)
+            # print(input_rays)
+            ray_sequence = optic.propagate_rays(input_rays, keep_paths=True)
+            # print(ray_sequence)
+            viewer = napari.Viewer()
+            viewer.layers.clear()
+            optic.visualize_rays(ray_sequence, viewer)
+            viewer.show()
+            napari.run()
+
+            plt.plot(optic._losses)        
+            plt.yscale('log')
+            plt.xlabel('Iteration')
+            plt.ylabel('Loss')
+            plt.title('Loss over Iterations')
+            plt.grid(True)
+            plt.show()
+
+        counter = input("how many iterations to run? ")
+        counter = int(counter)
+        first_loop = False
+
+    optic.gradient_update(sampler, n_rays=1000)
+    counter -= 1
 
 napari.run()
