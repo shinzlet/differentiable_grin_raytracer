@@ -30,16 +30,16 @@ def _to_composition(index):
     composition = tan(np.pi*(concentration - 0.5))
     return composition
 
-def _loss(target_rays: RayBundle, propagated_rays: RayBundle, coords: Coordinates) -> torch.Tensor:
+def _loss(target_rays: RayBundle, propagated_rays: RayBundle, coords: Coordinates, iteration: int) -> torch.Tensor:
     # target_rays and propagated_rays should have the same number of rays
     assert target_rays.rays.shape[1] == propagated_rays.rays.shape[1]
     # [2, NRays]: [[dy**2, dx**2], [dy**2, dx**2], ...]
     delta_xy_squared = (target_rays.rays[0:2] - propagated_rays.rays[0:2])**2
     # [1, NRays]: [hypot1, hypot2, ...]
     hypots = torch.sqrt(torch.sum(delta_xy_squared, dim=0))
-    # We sum and then normalize to the "girth" to make the scale of the angle loss (-1 to 1)
+    # We sum and then normalize to the max hypot to make the scale of the angle loss (-1 to 1)
     # and the position loss roughly comparable.
-    pos_loss = torch.sum(hypots) / torch.sqrt(coords.x_range() * coords.y_range())
+    pos_loss = torch.sum(hypots) / (coords.x_range ** 2 + coords.y_range ** 2) ** 0.5
 
     # We also want to penalize rays that are not pointing in the right direction.
     # We do this by computing the angle between the two direction vectors.
@@ -56,30 +56,35 @@ def _loss(target_rays: RayBundle, propagated_rays: RayBundle, coords: Coordinate
     angle_losses = 1 - cos_angles
     angle_loss = torch.sum(angle_losses)
 
-    # This weighting is arbitrary
-    loss = pos_loss + angle_loss
+    # This weighting is arbitrary. We use a schedule to prefer position at the start and angle at the end.
+    # 50/50 is achieved asymptotically, time constant is 100 iterations
+    angle_weight = 0.5 * (1 - np.exp(-iteration / 100))
+    loss = (1 - angle_weight) * pos_loss + angle_weight * angle_loss * 2
 
     return loss
 
 class Refractive3DOptic:
-    coord: Coordinates
+    coords: Coordinates
 
     def __init__(self, coords: Coordinates):
         self.coords = coords
         self.composition = torch.zeros(coords.shape, dtype=torch.float64)
+        self._iteration = 0
 
     def gradient_update(self, sampler, n_rays: int = 100):
         # Create ray bundles
         input_rays, output_rays = sampler(n_rays)
         # propagate the rays through
         propagated_rays = self.propagate_rays(input_rays, keep_paths=False)[-1]
-        loss = _loss(output_rays, propagated_rays)
+        loss = _loss(output_rays, propagated_rays, self.coords, self._iteration)
         # call backward to compute the gradient
         loss.backward()
         # apply the gradient to the composition tensor
         with torch.no_grad():
             self.composition -= 0.01 * self.composition.grad
         self.composition.grad.zero_()
+
+        self._iteration += 1
 
     def propagate_rays(self, ray_bundle: RayBundle, keep_paths: bool = False) -> list[RayBundle]:
         # compute the index field from the composition
@@ -176,29 +181,43 @@ class Refractive3DOptic:
         return ret
 
     def visualize_rays(self, ray_bundles: list[RayBundle], viewer):
-        index = _to_index(self.composition).detach().cpu().numpy()
+        with torch.no_grad():
+            index = _to_index(self.composition).detach().cpu().numpy()
 
-        viewer.add_image(
-            index,
-            name="Refractive Index",
-            scale=(self.coords.dz, self.coords.dy, self.coords.dx),
-            translate=(self.coords.z_min_center, self.coords.y_min_center, self.coords.x_min_center),
-            colormap="plasma",
-            contrast_limits=(1.0, 2.0),
-        )
+            viewer.add_image(
+                index,
+                name="Refractive Index",
+                scale=(self.coords.dz, self.coords.dy, self.coords.dx),
+                translate=(self.coords.z_min_center, self.coords.y_min_center, self.coords.x_min_center),
+                colormap="plasma",
+                contrast_limits=(1.0, 2.0),
+            )
 
-        # each elment of rays is a RayBundle at a different z plane. We need to unpack them
-        # into a list of (z,y,x) points for each ray.
-        # ray_bundles[0].rays.shape[1] == number of rays in a bundle
-        for ray_idx in range(ray_bundles[0].rays.shape[1]):
-            # len(ray_bundles) == number of z planes
-            ray = np.zeros((len(ray_bundles), 3), dtype=np.float64) # (z steps, 3)
-            for bundle_idx in range(len(ray_bundles)):
-                ray[bundle_idx, 0] = ray_bundles[bundle_idx].z
-                ray[bundle_idx, 1:3] = ray_bundles[bundle_idx].rays[0:2, ray_idx].detach().cpu().numpy()
+            overshoot = 0.3 # 30% overshoot ray extension
+            overshoot_length = overshoot * self.coords.z_range
+            overshoot_planes = int(np.ceil(overshoot_length / self.coords.dz))
 
-            # viewer.add_points(ray, size=0.2, face_color='red', name=f"Ray {ray_idx}")
-            viewer.add_shapes(ray, shape_type='path', edge_color='white', name=f"Ray {ray_idx} Path", edge_width=0.01)
+            # each elment of rays is a RayBundle at a different z plane. We need to unpack them
+            # into a list of (z,y,x) points for each ray.
+            # ray_bundles[0].rays.shape[1] == number of rays in a bundle
+            for ray_idx in range(ray_bundles[0].rays.shape[1]):
+                # len(ray_bundles) == number of z planes
+                ray = np.zeros((len(ray_bundles) + overshoot_planes, 3), dtype=np.float64) # (z steps, 3)
+                for bundle_idx in range(len(ray_bundles)):
+                    ray[bundle_idx, 0] = ray_bundles[bundle_idx].z
+                    ray[bundle_idx, 1:] = ray_bundles[bundle_idx].rays[0:2, ray_idx].detach().cpu().numpy()
+                
+                # Naively extrapolate extra z planes just for visualization
+                exit_pos_z = ray_bundles[-1].z
+                exit_pos_yx = ray_bundles[-1].rays[0:2, ray_idx]
+                exit_pos_dydz_dxdz = ray_bundles[-1].rays[2:, ray_idx]
+                for overshoot_z_idx in range(overshoot_planes):
+                    delta_z = self.coords.dz * overshoot_z_idx
+                    ray[-overshoot_z_idx-1][0] = exit_pos_z + delta_z
+                    ray[-overshoot_z_idx-1][1:] = exit_pos_yx + exit_pos_dydz_dxdz * delta_z
+
+                # viewer.add_points(ray, size=0.2, face_color='red', name=f"Ray {ray_idx}")
+                viewer.add_shapes(ray, shape_type='path', edge_color='white', name=f"Ray {ray_idx} Path", edge_width=0.01)
 
 # We use mm as our unit, although this is scale invariant. The factory
 # can manufacture a 3mm x 1" x 1" optic.
@@ -210,18 +229,18 @@ class Refractive3DOptic:
 
 # validation: maxwell's fisheye
 coords = Coordinates(
-    -1, 1, 100,
-    -1, 1, 20,
-    -1, 1, 20
+    0, 1, 50,
+    -1, 1, 40,
+    -1, 1, 40
 )
 
 def sampler(n: int):
     # Produce rays that emerge from a point at z = -1 and focus to a point at z = 1 with random
     # angular distribution.
     injection_angles = torch.rand(n, 1) * 2 * np.pi + 0.1
-    angle_magnitudes = torch.rand(n, 1)
+    angle_magnitudes = torch.rand(n, 1) * 2
     input_rays = RayBundle(
-        torch.Tensor([-1]).double(),
+        torch.Tensor([0]).double(),
         torch.Tensor([
             [0] * n,
             [0] * n,
@@ -255,7 +274,7 @@ import napari
 iteration = 0
 while True:
     print(f"Iteration {iteration}")
-    if iteration % 10 == 0:# and iteration > 0:
+    if iteration % 10 == 0 and iteration > 0:
         input_rays, output_rays = sampler(10)
         # print(input_rays)
         ray_sequence = optic.propagate_rays(input_rays, keep_paths=True)

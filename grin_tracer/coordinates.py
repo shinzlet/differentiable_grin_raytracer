@@ -152,11 +152,14 @@ class Coordinates:
     def xx(self) -> np.ndarray:
         return self._xx
     
+    @property
     def x_range(self) -> float:
         return self._x_max_face - self._x_min_face
     
+    @property
     def y_range(self) -> float:
         return self._y_max_face - self._y_min_face
     
+    @property
     def z_range(self) -> float:
         return self._z_max_face - self._z_min_face
