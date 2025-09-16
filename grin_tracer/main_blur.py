@@ -68,28 +68,70 @@ def _loss(target_rays: RayBundle, propagated_rays: RayBundle, coords: Coordinate
 class Refractive3DOptic:
     coords: Coordinates
 
-    def __init__(self, coords: Coordinates):
+    def __init__(self, coords: Coordinates, step_size: float = 0.02):
         self.coords = coords
         self.composition = torch.zeros(coords.shape, dtype=torch.float64, requires_grad=True)
         self._iteration = 0
-        self._optimizer = torch.optim.Adam([self.composition], lr=0.01)
         self._losses = []
+        self._step_size = step_size  # fixed step size
+
+    def _gaussian_kernel_1d(self, size: int, sigma: float, device, dtype):
+        """Create 1D Gaussian kernel."""
+        x = torch.arange(size, dtype=dtype, device=device) - (size - 1) / 2
+        kernel = torch.exp(-0.5 * (x / sigma) ** 2)
+        kernel /= kernel.sum()
+        return kernel
+
+    def _gaussian_kernel_3d(self, ksize, sigma, device, dtype):
+        """Create separable 3D Gaussian kernel as outer product."""
+        kx = self._gaussian_kernel_1d(ksize[2], sigma[2], device, dtype)
+        ky = self._gaussian_kernel_1d(ksize[1], sigma[1], device, dtype)
+        kz = self._gaussian_kernel_1d(ksize[0], sigma[0], device, dtype)
+        kernel_3d = torch.einsum("i,j,k->ijk", kz, ky, kx)
+        kernel_3d /= kernel_3d.sum()
+        return kernel_3d
+
+    def _gaussian_blur3d(self, vol: torch.Tensor) -> torch.Tensor:
+        """
+        Apply 3D Gaussian blur to a [Z, Y, X] tensor.
+        Kernel size ~1/10 of each axis, sigma ~ kernel_size/3.
+        """
+        sz = max(3, int(round(self.coords.shape[0] / 10)))
+        sy = max(3, int(round(self.coords.shape[1] / 10)))
+        sx = max(3, int(round(self.coords.shape[2] / 10)))
+
+        # Force odd sizes
+        sz += (sz + 1) % 2
+        sy += (sy + 1) % 2
+        sx += (sx + 1) % 2
+
+        sigma = (sz / 3.0, sy / 3.0, sx / 3.0)
+
+        kernel = self._gaussian_kernel_3d((sz, sy, sx), sigma, vol.device, vol.dtype)
+        kernel = kernel.unsqueeze(0).unsqueeze(0)  # [1,1,D,H,W]
+
+        v = vol.unsqueeze(0).unsqueeze(0)  # [1,1,Z,Y,X]
+        pad = (sx // 2, sx // 2, sy // 2, sy // 2, sz // 2, sz // 2)
+        v = F.pad(v, pad, mode="replicate")
+        out = F.conv3d(v, kernel, stride=1)
+        return out.squeeze(0).squeeze(0)
 
     def gradient_update(self, sampler, n_rays: int = 100):
-        # Create ray bundles
         input_rays, output_rays = sampler(n_rays)
-        # propagate the rays through
         propagated_rays, ray_penalties = self.propagate_rays(input_rays, keep_paths=False)
         loss = _loss(output_rays, propagated_rays[-1], self.coords, self._iteration)
-        # Add ray penalties to loss, divided by number of rays * number of z steps
         loss = loss + 150 * torch.sum(ray_penalties) / (input_rays.rays.shape[1] * self.coords.shape[0])
-        
-        # Zero gradients before backward pass
-        self._optimizer.zero_grad()
-        # call backward to compute the gradient
+
+        if self.composition.grad is not None:
+            self.composition.grad.zero_()
         loss.backward()
-        # apply the gradient using Adam optimizer
-        self._optimizer.step()
+
+        with torch.no_grad():
+            grad = self.composition.grad
+            if grad is None:
+                return
+            blurred_grad = self._gaussian_blur3d(grad)
+            self.composition -= self._step_size * blurred_grad
 
         self._losses.append(loss.item())
         self._iteration += 1
@@ -265,8 +307,8 @@ class Refractive3DOptic:
 # validation: maxwell's fisheye
 coords = Coordinates(
     0, 1, 40,
-    -1, 1, 40,
-    -1, 1, 40
+    -1, 1, 100,
+    -1, 1, 100
 )
 
 def sampler(n: int):
