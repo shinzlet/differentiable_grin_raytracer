@@ -270,7 +270,7 @@ class Optic:
                 for overshoot_z_idx in range(overshoot_planes):
                     delta_z = self.coords.dz * overshoot_z_idx
                     ray[-overshoot_z_idx-1][0] = exit_pos_z + delta_z
-                    ray[-overshoot_z_idx-1][1:] = exit_pos_yx + exit_pos_dydz_dxdz * delta_z
+                    ray[-overshoot_z_idx-1][1:] = (exit_pos_yx + exit_pos_dydz_dxdz * delta_z).detach().cpu().numpy()
 
                 # viewer.add_points(ray, size=0.2, face_color='red', name=f"Ray {ray_idx}")
                 viewer.add_shapes(ray, shape_type='path', edge_color='white', name=f"Ray {ray_idx} Path", edge_width=0.01)
