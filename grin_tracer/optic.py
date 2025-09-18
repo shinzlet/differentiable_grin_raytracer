@@ -28,7 +28,7 @@ def _to_composition(index):
     composition = tan(np.pi*(concentration - 0.5))
     return composition
 
-def _default_loss(target_rays: RayBundle, propagated_rays: RayBundle, coords: Coordinates, iteration: int) -> torch.Tensor:
+def _default_loss(index: torch.Tensor, target_rays: RayBundle, propagated_rays: RayBundle, coords: Coordinates, iteration: int) -> torch.Tensor:
     # target_rays and propagated_rays should have the same number of rays
     assert target_rays.rays.shape[1] == propagated_rays.rays.shape[1]
     # [2, NRays]: [[dy**2, dx**2], [dy**2, dx**2], ...]
@@ -65,23 +65,32 @@ def _default_loss(target_rays: RayBundle, propagated_rays: RayBundle, coords: Co
 class Optic:
     coords: Coordinates
 
-    def __init__(self, coords: Coordinates, loss_func=None):
+    def __init__(self, coords: Coordinates):
         self.coords = coords
         self.composition = torch.zeros(coords.shape, dtype=torch.float64, requires_grad=True)
         self._iteration = 0
         self._optimizer = torch.optim.Adam([self.composition], lr=0.01)
         self._losses = []
-        self._loss_func = loss_func if loss_func is not None else _default_loss
 
-    def gradient_update(self, sampler, n_rays: int = 100):
-        if self._iteration % 500 == 0:
+    def gradient_update(self, sampler, n_rays: int = 100, loss_func = _default_loss, post_update_composition_regularizer = None):
+        """
+        Perform one gradient update step using n_rays sampled from the sampler function.
+        The sampler function should take an integer n and return a  tuple (input_rays, output_rays)
+        where each is a RayBundle with n rays.
+
+        Additionally, a post_update_composition_regularizer function can be provided that takes
+        the composition tensor and modifies it in-place after each update step. This can be used
+        to enforce constraints on the composition, such as clamping values or applying smoothing.
+        """
+        if self._iteration % 10 == 0:
             self._input_rays, self._output_rays = sampler(n_rays)
             print("Changing rays")
         # Create ray bundles
         input_rays, output_rays = self._input_rays, self._output_rays
+        index = _to_index(self.composition)
         # propagate the rays through
-        propagated_rays, ray_penalties = self.propagate_rays(input_rays, keep_paths=False)
-        loss = self._loss_func(output_rays, propagated_rays[-1], self.coords, self._iteration)
+        propagated_rays, ray_penalties = self.propagate_rays(input_rays, keep_paths=False, index=index)
+        loss = loss_func(index, output_rays, propagated_rays[-1], self.coords, self._iteration)
         # Add ray penalties to loss, divided by number of rays * number of z steps
         loss = loss + 150 * torch.sum(ray_penalties) / (input_rays.rays.shape[1] * self.coords.shape[0])
         print(150 * torch.sum(ray_penalties) / (input_rays.rays.shape[1] * self.coords.shape[0]), "Loss:", loss.item(), "Max comp:", torch.max(self.composition).item(), "Min comp:", torch.min(self.composition).item())
@@ -93,12 +102,20 @@ class Optic:
         # apply the gradient using Adam optimizer
         self._optimizer.step()
 
+        if post_update_composition_regularizer is not None:
+            with torch.no_grad():
+                post_update_composition_regularizer(self.composition, self._iteration)
+
         self._losses.append(loss.item())
         self._iteration += 1
 
-    def propagate_rays(self, ray_bundle: RayBundle, keep_paths: bool = False) -> tuple[list[RayBundle], torch.Tensor]:
-        # compute the index field from the composition
-        n = _to_index(self.composition)
+    def propagate_rays(self, ray_bundle: RayBundle, keep_paths: bool = False, index=None) -> tuple[list[RayBundle], torch.Tensor]:
+        if index is None:
+            # compute the index field from the composition
+            n = _to_index(self.composition)
+        else:
+            # Use a precomputed index field
+            n = index
         nz, ny, nx = spatial_gradient(n, self.coords)
         n_half = (n[1:] + n[:-1]) / 2
         nz_half = (nz[1:] + nz[:-1]) / 2
