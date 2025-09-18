@@ -17,3 +17,7 @@ I didn't notice any big change from this yet.
 
 I should clean up the code so I can do tests like this a little more easily... And also
 record results / plots / volumes alongside tests.
+
+Ideas from jordao:
+- ramp up the learning rate so that the initial batches can only make small changes
+- use a cyclic LR to avoid local minima

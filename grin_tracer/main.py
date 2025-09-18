@@ -9,6 +9,17 @@ from grin_tracer.ray_bundle import RayBundle
 from grin_tracer.optic import Optic
 from grin_tracer.interactive_trainer import InteractiveTrainer
 
+dtype = torch.float32
+
+if torch.backends.mps.is_available():
+    device = torch.device("mps")
+elif torch.cuda.is_available():
+    device = torch.device("cuda")
+else:
+    device = torch.device("cpu")
+
+torch.set_default_device(device)
+
 # We use mm as our unit, although this is scale invariant. The factory
 # can manufacture a 3mm x 1" x 1" optic.
 # coords = Coordinates(
@@ -76,25 +87,27 @@ def sampler(n: int):
     injection_angles = torch.rand(n, 1) * 2 * np.pi + 0.1
     angle_magnitudes = torch.rand(n, 1) * 2
     input_rays = RayBundle(
-        torch.Tensor([0]).double(),
-        torch.Tensor([
+        torch.tensor([0], device=device, dtype=dtype),
+        torch.tensor([
             [0] * n,
             [0] * n,
             torch.cos(injection_angles) * angle_magnitudes,
             torch.sin(injection_angles) * angle_magnitudes
-        ]).double())
+        ], device=device, dtype=dtype))
     
     output_rays = RayBundle(
-        torch.Tensor([1]).double(),
-        torch.Tensor([
+        torch.tensor([1], device=device, dtype=dtype),
+        torch.tensor([
             [0] * n,
             [0] * n,
             -torch.cos(injection_angles) * angle_magnitudes,
             -torch.sin(injection_angles) * angle_magnitudes
-        ]).double())
+        ], device=device, dtype=dtype))
     return input_rays, output_rays
 
-optic = Optic(coords)
+optic = Optic(coords, device=device, dtype=dtype)
+
+print("Optic device:", optic.composition.device)
 
 trainer = InteractiveTrainer(
     optic,

@@ -65,12 +65,14 @@ def _default_loss(index: torch.Tensor, target_rays: RayBundle, propagated_rays: 
 class Optic:
     coords: Coordinates
 
-    def __init__(self, coords: Coordinates):
+    def __init__(self, coords: Coordinates, device='cpu', dtype=torch.float32):
         self.coords = coords
-        self.composition = torch.zeros(coords.shape, dtype=torch.float64, requires_grad=True)
+        self.composition = torch.zeros(coords.shape, dtype=dtype, device=device, requires_grad=True)
         self._iteration = 0
         self._optimizer = torch.optim.Adam([self.composition], lr=0.01)
         self._losses = []
+        self.dtype = dtype
+        self.device = device
 
     def gradient_update(self, sampler, n_rays: int = 100, loss_func = _default_loss, post_update_composition_regularizer = None):
         """
@@ -128,7 +130,7 @@ class Optic:
         # We accumulate penalties for each ray based on "niceness" criteria. Examples
         # could be things like distance from the center or extreme angles. These can
         # be added to loss functions later.
-        ray_pentalties = torch.zeros(ray_bundle.rays.shape[1], dtype=torch.float64)
+        ray_pentalties = torch.zeros(ray_bundle.rays.shape[1], device=self.device, dtype=self.dtype)
 
         # RayBundle should be a z scalar and a 4xNRays tensor as y, x, dydz, dxdz. This will march
         # the bundle in-place
